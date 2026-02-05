@@ -1,0 +1,231 @@
+# ============================================================
+# BACKUP ROTAZIONALE v2.0 — CONFIGURAZIONE
+# ============================================================
+
+general:
+  log_dir: /var/log/backup_system
+  log_level: INFO
+  lock_file: /var/run/backup_system.lock
+  state_dir: /var/lib/backup_system        # stato persistente (JSON history)
+  dry_run: false
+  # Parallelismo: quante sorgenti copiare in parallelo (1 = sequenziale)
+  parallel_workers: 3
+
+# --- SICUREZZA ---
+security:
+  # Crittografia LUKS sulle partizioni di destinazione
+  luks:
+    enabled: true
+    # File contenente la passphrase LUKS (permessi 600, owner root)
+    key_file: /etc/backup_system/luks.key
+    # Timeout apertura LUKS in secondi
+    open_timeout: 30
+
+  # Verifica integrità post-backup
+  integrity:
+    enabled: true
+    # Algoritmo hash: sha256, sha1, md5 (sha256 consigliato)
+    algorithm: sha256
+    # Verifica un campione casuale di file (percentuale 1-100)
+    sample_percent: 5
+    # Salva manifest di hash nella partizione di destinazione
+    save_manifest: true
+
+  # Rilevamento ransomware / anomalie
+  anomaly_detection:
+    enabled: true
+    # Se più di X% dei file cambia rispetto al backup precedente, BLOCCA
+    max_change_percent: 40
+    # Se la dimensione totale cala di più di X%, BLOCCA
+    max_shrink_percent: 30
+    # Estensioni sospette (tipiche ransomware)
+    suspicious_extensions:
+      - ".encrypted"
+      - ".locked"
+      - ".crypto"
+      - ".crypt"
+      - ".ransom"
+      - ".wcry"
+      - ".wncry"
+      - ".locky"
+      - ".cerber"
+      - ".zepto"
+      - ".zzzzz"
+
+# --- RESILIENZA ---
+resilience:
+  # Retry mount con backoff esponenziale
+  mount_retries: 3
+  mount_retry_base_delay: 5       # secondi (poi 10, 20 …)
+
+  # Pre-check sorgenti (ping + smbclient)
+  pre_check:
+    enabled: true
+    ping_timeout: 3               # secondi
+    smb_timeout: 10               # secondi
+
+  # Spazio disco minimo richiesto sulla destinazione (in GB)
+  min_free_space_gb: 10
+
+  # Rsync retry
+  rsync_retries: 2
+  rsync_retry_delay: 30           # secondi
+
+# --- SORGENTI WINDOWS (CIFS/SMB) ---
+sources:
+  - name: "FileServer-Dati"
+    type: cifs
+    unc: "//192.168.1.10/Dati"
+    host: "192.168.1.10"          # per pre-check (ping)
+    mount_point: /mnt/source/fileserver_dati
+    credentials_file: /etc/backup_system/creds_fileserver
+    mount_options: "vers=3.0,seal,ro"
+    include_paths: []
+    exclude_patterns:
+      - "*.tmp"
+      - "~$*"
+      - "Thumbs.db"
+      - ".DS_Store"
+      - "$Recycle.Bin"
+    # Priorità: 1=alta (eseguita per prima), 9=bassa
+    priority: 1
+
+  - name: "FileServer-Contabilita"
+    type: cifs
+    unc: "//192.168.1.10/Contabilita"
+    host: "192.168.1.10"
+    mount_point: /mnt/source/fileserver_conta
+    credentials_file: /etc/backup_system/creds_fileserver
+    mount_options: "vers=3.0,seal,ro"
+    include_paths: []
+    exclude_patterns:
+      - "*.tmp"
+      - "~$*"
+    priority: 1
+
+  - name: "PC-Direzione"
+    type: cifs
+    unc: "//192.168.1.50/C$"
+    host: "192.168.1.50"
+    mount_point: /mnt/source/pc_direzione
+    credentials_file: /etc/backup_system/creds_domain_admin
+    mount_options: "vers=3.0,seal,ro"
+    include_paths:
+      - "Users"
+    exclude_patterns:
+      - "*.tmp"
+      - "pagefile.sys"
+      - "hiberfil.sys"
+      - "swapfile.sys"
+      - "NTUSER.DAT*"
+      - "ntuser.dat*"
+    priority: 2
+
+  # …aggiungi qui le altre sorgenti (fino a 50)…
+
+# --- DESTINAZIONI ROTAZIONALI ---
+destinations:
+  base_mount_point: /mnt/backup
+
+  partitions:
+    1:
+      device: "/dev/sdb1"
+      luks_name: "backup_lun"     # nome del device mapper LUKS
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_LUN"
+    2:
+      device: "/dev/sdb2"
+      luks_name: "backup_mar"
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_MAR"
+    3:
+      device: "/dev/sdb3"
+      luks_name: "backup_mer"
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_MER"
+    4:
+      device: "/dev/sdb4"
+      luks_name: "backup_gio"
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_GIO"
+    5:
+      device: "/dev/sdc1"
+      luks_name: "backup_ven"
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_VEN"
+    6:
+      device: "/dev/sdc2"
+      luks_name: "backup_sab"
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_SAB"
+    7:
+      device: "/dev/sdc3"
+      luks_name: "backup_dom"
+      fstype: "ext4"
+      mount_options: "noatime,data=ordered"
+      label: "BACKUP_DOM"
+
+# --- RSYNC ---
+rsync:
+  bandwidth_limit_kbps: 0
+  extra_args: []
+  timeout_seconds: 14400
+
+# --- RETENTION ---
+retention:
+  # Mantieni anche un backup mensile (primo backup del mese)
+  monthly_snapshots:
+    enabled: true
+    # Directory per snapshot mensili
+    snapshot_dir: /mnt/backup_archive/monthly
+    # Device/partizione per gli snapshot mensili
+    device: "/dev/sdd1"
+    luks_name: "backup_monthly"
+    fstype: "ext4"
+    mount_options: "noatime"
+    # Quanti mesi mantenere
+    keep_months: 6
+
+# --- RESTORE ---
+restore:
+  # Directory temporanea per il restore
+  staging_dir: /mnt/restore_staging
+
+# --- DASHBOARD WEB ---
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8847
+  # Protezione con password (basic auth)
+  auth:
+    enabled: true
+    username: "admin"
+    # Generare con: python3 -c "import hashlib; print(hashlib.sha256(b'password').hexdigest())"
+    password_sha256: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+
+# --- NOTIFICHE ---
+notifications:
+  email:
+    enabled: false
+    smtp_server: "smtp.example.com"
+    smtp_port: 587
+    smtp_tls: true
+    smtp_user: "backup@example.com"
+    smtp_password: "changeme"
+    recipients:
+      - "admin@example.com"
+    # Invia solo in caso di errore? (false = invia sempre)
+    only_on_error: false
+
+  # Webhook generico (Slack, Teams, Telegram, ecc.)
+  webhook:
+    enabled: false
+    url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+    # Template: {status}, {day}, {summary}, {errors}
+    template: '{"text": "Backup {day}: {status}\n{summary}"}'
