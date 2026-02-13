@@ -2,6 +2,8 @@
 """
 backup_dashboard.py — Dashboard web per monitorare i backup.
 Leggera, single-file, basata su Flask.
+
+SECURITY: Tutti i dati dinamici vengono sanitizzati per prevenire XSS.
 """
 
 import os
@@ -9,6 +11,7 @@ import json
 import hashlib
 import functools
 import logging
+import html
 from pathlib import Path
 from datetime import datetime
 
@@ -29,6 +32,55 @@ WEEKDAY_NAMES = {
 
 
 # ═════════════════════════════════════════════════════════════
+#  SECURITY: HTML SANITIZATION
+# ═════════════════════════════════════════════════════════════
+
+def sanitize_html(text) -> str:
+    """
+    Escape HTML characters per prevenire XSS.
+    Converte: < > & " ' in entità HTML.
+    """
+    if text is None:
+        return ""
+    return html.escape(str(text), quote=True)
+
+
+def sanitize_report(report: dict) -> dict:
+    """Sanitizza un report prima di inviarlo al client."""
+    if not report:
+        return report
+    
+    result = report.copy()
+    
+    # Sanitizza campi di primo livello che potrebbero contenere input utente
+    string_fields = ["hostname", "day_name", "message", "error"]
+    for key in string_fields:
+        if key in result and isinstance(result[key], str):
+            result[key] = sanitize_html(result[key])
+    
+    # Sanitizza le sorgenti
+    if "sources" in result and isinstance(result["sources"], list):
+        sanitized_sources = []
+        for source in result["sources"]:
+            if isinstance(source, dict):
+                s = source.copy()
+                # Sanitizza tutti i campi stringa che potrebbero essere pericolosi
+                dangerous_fields = [
+                    "source_name", "error_message", "skip_reason", 
+                    "mount_point", "path", "unc", "host"
+                ]
+                for key in dangerous_fields:
+                    if key in s and isinstance(s[key], str):
+                        s[key] = sanitize_html(s[key])
+                sanitized_sources.append(s)
+            else:
+                sanitized_sources.append(source)
+        result["sources"] = sanitized_sources
+    
+    return result
+
+
+# ═════════════════════════════════════════════════════════════
 #  AUTH
 # ═════════════════════════════════════════════════════════════
 
@@ -39,7 +91,13 @@ def check_auth(username: str, password: str) -> bool:
     expected_user = auth_cfg.get("username", "admin")
     expected_hash = auth_cfg.get("password_sha256", "")
     actual_hash = hashlib.sha256(password.encode()).hexdigest()
-    return username == expected_user and actual_hash == expected_hash
+    # Usa confronto a tempo costante per prevenire timing attacks
+    try:
+        import hmac
+        return hmac.compare_digest(username, expected_user) and \
+               hmac.compare_digest(actual_hash, expected_hash)
+    except ImportError:
+        return username == expected_user and actual_hash == expected_hash
 
 
 def require_auth(f):
@@ -68,7 +126,9 @@ def load_history() -> list[dict]:
         return []
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+            # Sanitizza ogni entry dello storico
+            return [sanitize_report(entry) for entry in data]
     except (json.JSONDecodeError, OSError):
         return []
 
@@ -80,7 +140,9 @@ def load_latest_report() -> dict | None:
         return None
     try:
         with open(reports[0]) as f:
-            return json.load(f)
+            report = json.load(f)
+            # Sanitizza il report prima di restituirlo
+            return sanitize_report(report)
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -88,16 +150,19 @@ def load_latest_report() -> dict | None:
 def get_partition_status() -> list[dict]:
     """Verifica lo stato di mount di ogni partizione."""
     statuses = []
-    with open("/proc/mounts", "r") as f:
-        mounts = f.read()
+    try:
+        with open("/proc/mounts", "r") as f:
+            mounts = f.read()
+    except OSError:
+        mounts = ""
 
     for day in range(1, 8):
         mp = f"/mnt/backup/day_{day}"
         statuses.append({
             "day": day,
-            "name": WEEKDAY_NAMES.get(day, "?"),
+            "name": WEEKDAY_NAMES.get(day, "?"),  # Già sicuro (valori hardcoded)
             "mounted": mp in mounts,
-            "mount_point": mp,
+            "mount_point": mp,  # Path interno, non user input
         })
     return statuses
 
@@ -112,6 +177,7 @@ DASHBOARD_HTML = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
 <title>Backup Dashboard</title>
 <style>
   :root {
@@ -201,12 +267,18 @@ DASHBOARD_HTML = """
 </div>
 
 <script>
+// ═══════════════════════════════════════════════════════════
+// SECURITY: Usa sempre textContent o createElement, MAI innerHTML con dati
+// Il server già sanitizza, ma usiamo textContent per doppia sicurezza
+// ═══════════════════════════════════════════════════════════
+
 function fmt(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
   if (bytes < 1073741824) return (bytes/1048576).toFixed(1) + ' MB';
   return (bytes/1073741824).toFixed(2) + ' GB';
 }
+
 function fmtDur(s) {
   if (!s) return '—';
   if (s < 60) return Math.round(s) + 's';
@@ -223,14 +295,16 @@ async function loadData() {
       fetch('/api/partitions').then(r=>r.json()),
     ]);
 
-    // KPI
+    // KPI - usa textContent (sicuro)
     if (latest) {
       const d = new Date(latest.timestamp);
       document.getElementById('last-date').textContent = latest.day_name || '—';
-      document.getElementById('last-status').textContent =
-        d.toLocaleDateString('it') + ' ' + d.toLocaleTimeString('it',{hour:'2-digit',minute:'2-digit'});
-      document.getElementById('last-status').className =
-        latest.all_ok ? 'status-ok' : 'status-err';
+      
+      const lastStatusEl = document.getElementById('last-status');
+      lastStatusEl.textContent = d.toLocaleDateString('it') + ' ' + 
+        d.toLocaleTimeString('it',{hour:'2-digit',minute:'2-digit'});
+      lastStatusEl.className = latest.all_ok ? 'status-ok' : 'status-err';
+      
       document.getElementById('last-data').textContent = fmt(latest.total_bytes_transferred||0);
       document.getElementById('last-duration').textContent = fmtDur(latest.total_elapsed_seconds);
     }
@@ -245,64 +319,139 @@ async function loadData() {
       el.className = 'big ' + (pct >= 90 ? 'status-ok' : pct >= 70 ? 'status-warn' : 'status-err');
     }
 
-    // Partitions
-    let pHTML = '';
+    // Partitions - costruisce DOM in modo sicuro
+    const partitionsEl = document.getElementById('partitions');
+    partitionsEl.innerHTML = '';
+    
     parts.forEach(p => {
-      let cls = p.mounted ? 'dot-mounted' : 'dot-unmounted';
-      let today = new Date().getDay(); // 0=Sun
+      const card = document.createElement('div');
+      card.className = 'card day-card';
+      
+      let today = new Date().getDay();
       let isoDay = today === 0 ? 7 : today;
-      let isToday = p.day === isoDay;
-      pHTML += '<div class="card day-card' + (isToday ? '" style="border:1px solid var(--accent)"' : '"') + '>' +
-        '<div class="dot '+cls+'"></div>' +
-        '<div style="font-weight:600">' + p.name + '</div>' +
-        '<div style="font-size:.75rem;color:var(--muted)">' + (p.mounted ? '🟢 Online' : '⚫ Offline') + '</div>' +
-        '</div>';
+      if (p.day === isoDay) {
+        card.style.border = '1px solid var(--accent)';
+      }
+      
+      const dot = document.createElement('div');
+      dot.className = 'dot ' + (p.mounted ? 'dot-mounted' : 'dot-unmounted');
+      card.appendChild(dot);
+      
+      const nameDiv = document.createElement('div');
+      nameDiv.style.fontWeight = '600';
+      nameDiv.textContent = p.name;
+      card.appendChild(nameDiv);
+      
+      const statusDiv = document.createElement('div');
+      statusDiv.style.cssText = 'font-size:.75rem;color:var(--muted)';
+      statusDiv.textContent = p.mounted ? '🟢 Online' : '⚫ Offline';
+      card.appendChild(statusDiv);
+      
+      partitionsEl.appendChild(card);
     });
-    document.getElementById('partitions').innerHTML = pHTML;
 
-    // History chart
-    let chartHTML = '';
+    // History chart - costruisce DOM in modo sicuro
+    const chartEl = document.getElementById('history-chart');
+    chartEl.innerHTML = '';
+    
     let last30 = hist.slice(-30);
     let maxBytes = Math.max(...last30.map(h=>h.total_bytes_transferred||1));
+    
     last30.forEach(h => {
       let height = Math.max(4, ((h.total_bytes_transferred||0)/maxBytes)*100);
       let color = h.all_ok ? 'var(--green)' : (h.failed > 0 ? 'var(--red)' : 'var(--yellow)');
       let d = new Date(h.timestamp);
-      let tip = d.toLocaleDateString('it',{day:'2-digit',month:'2-digit'}) + ': ' +
-        (h.all_ok ? 'OK' : h.failed+' errori');
-      chartHTML += '<div title="'+tip+'" style="flex:1;display:flex;flex-direction:column;justify-content:end;align-items:center">' +
-        '<div class="chart-bar" style="width:100%;height:'+height+'px;background:'+color+'"></div>' +
-        '<div style="font-size:.6rem;color:var(--muted);margin-top:2px">'+d.getDate()+'</div></div>';
+      
+      const col = document.createElement('div');
+      col.style.cssText = 'flex:1;display:flex;flex-direction:column;justify-content:end;align-items:center';
+      
+      const bar = document.createElement('div');
+      bar.className = 'chart-bar';
+      bar.style.cssText = 'width:100%;height:'+height+'px;background:'+color;
+      bar.title = d.toLocaleDateString('it',{day:'2-digit',month:'2-digit'}) + ': ' +
+        (h.all_ok ? 'OK' : (h.failed||0)+' errori');
+      col.appendChild(bar);
+      
+      const label = document.createElement('div');
+      label.style.cssText = 'font-size:.6rem;color:var(--muted);margin-top:2px';
+      label.textContent = d.getDate();
+      col.appendChild(label);
+      
+      chartEl.appendChild(col);
     });
-    document.getElementById('history-chart').innerHTML = chartHTML;
 
-    // Detail table
+    // Detail table - costruisce DOM in modo sicuro (SECURITY FIX)
+    const tableEl = document.getElementById('detail-table');
+    tableEl.innerHTML = '';
+    
     if (latest && latest.sources) {
-      let rows = '';
       latest.sources.forEach(s => {
-        let badge = '';
-        if (s.anomaly_blocked) badge = '<span class="badge badge-block">BLOCCATO</span>';
-        else if (s.skipped) badge = '<span class="badge badge-skip">SALTATO</span>';
-        else if (s.success) badge = '<span class="badge badge-ok">OK</span>';
-        else badge = '<span class="badge badge-err">ERRORE</span>';
-
-        let integrity = '—';
-        if (s.integrity_verified > 0) {
-          integrity = s.integrity_errors > 0
-            ? '<span class="status-err">⚠ '+s.integrity_errors+'/'+s.integrity_verified+'</span>'
-            : '<span class="status-ok">✓ '+s.integrity_verified+'</span>';
+        const tr = document.createElement('tr');
+        
+        // Sorgente - textContent previene XSS
+        const tdName = document.createElement('td');
+        tdName.textContent = s.source_name || '—';
+        tr.appendChild(tdName);
+        
+        // Stato
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge';
+        if (s.anomaly_blocked) {
+          badge.className += ' badge-block';
+          badge.textContent = 'BLOCCATO';
+        } else if (s.skipped) {
+          badge.className += ' badge-skip';
+          badge.textContent = 'SALTATO';
+        } else if (s.success) {
+          badge.className += ' badge-ok';
+          badge.textContent = 'OK';
+        } else {
+          badge.className += ' badge-err';
+          badge.textContent = 'ERRORE';
         }
-
-        rows += '<tr><td>'+s.source_name+'</td><td>'+badge+'</td>' +
-          '<td>'+(s.files_transferred||0).toLocaleString()+'</td>' +
-          '<td>'+fmt(s.bytes_transferred||0)+'</td>' +
-          '<td>'+fmtDur(s.elapsed_seconds)+'</td>' +
-          '<td>'+integrity+'</td></tr>';
+        tdStatus.appendChild(badge);
+        tr.appendChild(tdStatus);
+        
+        // File
+        const tdFiles = document.createElement('td');
+        tdFiles.textContent = (s.files_transferred||0).toLocaleString();
+        tr.appendChild(tdFiles);
+        
+        // Dati
+        const tdData = document.createElement('td');
+        tdData.textContent = fmt(s.bytes_transferred||0);
+        tr.appendChild(tdData);
+        
+        // Durata
+        const tdDur = document.createElement('td');
+        tdDur.textContent = fmtDur(s.elapsed_seconds);
+        tr.appendChild(tdDur);
+        
+        // Integrità
+        const tdInteg = document.createElement('td');
+        if (s.integrity_verified > 0) {
+          const span = document.createElement('span');
+          if (s.integrity_errors > 0) {
+            span.className = 'status-err';
+            span.textContent = '⚠ ' + s.integrity_errors + '/' + s.integrity_verified;
+          } else {
+            span.className = 'status-ok';
+            span.textContent = '✓ ' + s.integrity_verified;
+          }
+          tdInteg.appendChild(span);
+        } else {
+          tdInteg.textContent = '—';
+        }
+        tr.appendChild(tdInteg);
+        
+        tableEl.appendChild(tr);
       });
-      document.getElementById('detail-table').innerHTML = rows;
     }
 
-  } catch(e) { console.error('Errore caricamento dati:', e); }
+  } catch(e) { 
+    console.error('Errore caricamento dati:', e); 
+  }
 }
 
 loadData();
@@ -354,11 +503,14 @@ def api_health():
 
     last = history[-1]
     if last.get("all_ok", False):
-        return jsonify({"status": "healthy", "last_backup": last.get("timestamp")}), 200
+        return jsonify({
+            "status": "healthy", 
+            "last_backup": last.get("timestamp", "")
+        }), 200
     else:
         return jsonify({
             "status": "unhealthy",
-            "last_backup": last.get("timestamp"),
+            "last_backup": last.get("timestamp", ""),
             "failed": last.get("failed", 0),
         }), 503
 
