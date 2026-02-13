@@ -1,3 +1,5 @@
+<img width="1200" height="1500" alt="infrastruttura_backup_linkedin" src="https://github.com/user-attachments/assets/26dddc8b-cdf2-4399-bbab-ede2504dd178" />
+
 <div align="center">
 
 # 🛡️ Backup Rotazionale
